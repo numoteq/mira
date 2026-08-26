@@ -279,6 +279,12 @@ class ProviderConfig(BaseModel):
     type: str = "github"
 
 
+class ForgejoConfig(BaseModel):
+    required_review_topic: str = ""
+    approve_successful_reviews: bool = False
+    approve_skipped_reviews: bool = False
+
+
 class DatabaseConfig(BaseModel):
     url: str = ""  # empty = SQLite fallback. "postgresql://user:pass@host:5432/mira"
     admin_password: str = (
@@ -292,6 +298,7 @@ class MiraConfig(BaseModel):
     review: ReviewConfig = Field(default_factory=ReviewConfig)
     index: IndexConfig = Field(default_factory=IndexConfig)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    forgejo: ForgejoConfig = Field(default_factory=ForgejoConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
 
 

@@ -135,6 +135,27 @@ class ForgejoProvider(BaseProvider):
             platform="forgejo",
         )
 
+    async def get_repo_topics(self, owner: str, repo: str) -> set[str]:
+        """Return authoritative, case-normalized Forgejo repository topics."""
+        url = f"{self._api}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/topics"
+        try:
+            resp = await self._request("GET", url)
+            data = resp.json()
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(f"Failed to fetch Forgejo repository topics: {exc}") from exc
+
+        if not isinstance(data, dict) or not isinstance(data.get("topics"), list):
+            raise ProviderError("Malformed Forgejo repository topics response")
+
+        topics: set[str] = set()
+        for topic in data["topics"]:
+            if not isinstance(topic, str) or not topic.strip():
+                raise ProviderError("Malformed Forgejo repository topics response")
+            topics.add(topic.strip().casefold())
+        return topics
+
     async def get_pr_diff(self, pr_info: PRInfo) -> str:
         """Fetch the raw unified diff for the PR."""
         try:
@@ -142,11 +163,7 @@ class ForgejoProvider(BaseProvider):
                 "GET",
                 f"{self._pr(pr_info)}.diff",
                 headers={"Accept": "text/plain"},
-                ok=(200, 404),
             )
-            if resp.status_code == 404:
-                logger.warning("PR diff returned 404 for %s", pr_info.url)
-                return ""
             return resp.text
         except ProviderError:
             raise
@@ -266,9 +283,9 @@ class ForgejoProvider(BaseProvider):
 
     async def post_review(
         self, pr_info: PRInfo, result: ReviewResult, bot_name: str = "miracodeai"
-    ) -> None:
+    ) -> list[int]:
         if not result.comments:
-            return
+            return []
 
         summary_text = ""
         if result.summary:
@@ -292,14 +309,18 @@ class ForgejoProvider(BaseProvider):
 
         try:
             await self._request("POST", f"{self._pr(pr_info)}/reviews", json=review_body)
+            return [0] * len(result.comments)
         except ProviderError as exc:
             if getattr(exc, "status_code", None) == 422:
                 logger.warning("Inline review failed (%s); posting as individual comments", exc)
+                summary_failed = False
                 if summary_text:
                     try:
                         await self.post_comment(pr_info, summary_text)
                     except ProviderError:
                         logger.warning("Failed to post PR summary comment (fallback)")
+                        summary_failed = True
+                failed_comments: list[str] = []
                 for comment in result.comments:
                     body = format_comment_body(comment, bot_name=bot_name)
                     note = f"**`{comment.path}:{comment.line}`**\n\n{body}"
@@ -311,8 +332,22 @@ class ForgejoProvider(BaseProvider):
                             comment.path,
                             comment.line,
                         )
-            else:
-                raise
+                        failed_comments.append(f"{comment.path}:{comment.line}")
+                if summary_failed or failed_comments:
+                    failures = (["summary"] if summary_failed else []) + failed_comments
+                    raise ProviderError(
+                        "Failed to deliver Forgejo review comments: " + ", ".join(failures)
+                    ) from exc
+                return [0] * len(result.comments)
+            raise
+
+    async def approve_pr(self, pr_info: PRInfo, body: str) -> None:
+        """Submit a formal approval for the exact reviewed commit."""
+        await self._request(
+            "POST",
+            f"{self._pr(pr_info)}/reviews",
+            json={"event": "APPROVED", "body": body, "commit_id": pr_info.head_sha},
+        )
 
     async def post_comment(self, pr_info: PRInfo, body: str) -> None:
         await self._request(

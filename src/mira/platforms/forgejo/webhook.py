@@ -13,7 +13,7 @@ import hashlib
 import hmac
 import logging
 import re
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -29,8 +29,15 @@ from mira.platforms.mentions import (
     strip_mentions,
 )
 from mira.providers import create_provider
+from mira.providers.forgejo import ForgejoProvider
 
 logger = logging.getLogger(__name__)
+
+_REVIEW_COMPLETED_BODY = "Mira review completed."
+
+
+def _forgejo_provider(token: str) -> ForgejoProvider:
+    return cast(ForgejoProvider, create_provider("forgejo", token))
 
 
 async def list_forgejo_repos(token: str, base_url: str) -> list[dict]:
@@ -105,6 +112,55 @@ def _split_repo_path(full_name: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+def _pr_url_from_payload(payload: dict[str, Any]) -> str:
+    pr = payload.get("pull_request", {})
+    if pr.get("html_url"):
+        return str(pr["html_url"])
+    repo = payload.get("repository", {})
+    return f"{repo.get('html_url', '')}/pulls/{pr.get('number', '')}"
+
+
+async def _required_topic_present(
+    owner: str,
+    repo: str,
+    auth: PlatformAuth,
+    required_topic: str,
+) -> bool | None:
+    """Return None when enrollment cannot be established authoritatively."""
+    if not required_topic:
+        return True
+    try:
+        token = await auth.get_token()
+        provider = _forgejo_provider(token)
+        topics = await provider.get_repo_topics(owner, repo)
+    except Exception as exc:
+        logger.warning("Forgejo topic gate failed closed for %s/%s: %s", owner, repo, exc)
+        return None
+    return required_topic in topics
+
+
+async def _approve_pr_url(auth: PlatformAuth, pr_url: str, body: str) -> None:
+    token = await auth.get_token()
+    provider = _forgejo_provider(token)
+    pr_info = await provider.get_pr_info(pr_url)
+    if not pr_info.head_sha:
+        raise ValueError("Forgejo PR head SHA is unavailable; approval withheld")
+    await provider.approve_pr(pr_info, body)
+
+
+async def _approve_skipped_pr(auth: PlatformAuth, pr_url: str, body: str) -> None:
+    try:
+        await _approve_pr_url(auth, pr_url, body)
+    except Exception:
+        logger.exception("Failed to submit skipped Forgejo approval for %s", pr_url)
+
+
+def _approval_body(skipped_reason: str | None) -> str:
+    if skipped_reason:
+        return f"Mira review skipped: {skipped_reason}."
+    return _REVIEW_COMPLETED_BODY
+
+
 async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
     """Review a pull request (open / reopen / new commits)."""
     from mira.platforms.handlers import PAUSE_LABEL, run_pr_review
@@ -112,15 +168,6 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
 
     action = payload.get("action", "")
     if action not in ("opened", "synchronized", "reopened"):
-        return
-
-    # Same opt-out as GitHub's `synchronize`: new commits on an already open PR
-    # only get reviewed on an explicit `@bot review` comment.
-    if action == "synchronized" and not load_config().review.review_on_synchronize:
-        logger.info(
-            "Forgejo PR %s push skipped — review.review_on_synchronize is off",
-            payload.get("repository", {}).get("full_name", "?"),
-        )
         return
 
     pr = payload.get("pull_request", {})
@@ -135,8 +182,24 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
     number = pr.get("number")
     if number is None:
         return
-    pr_url = pr.get("html_url", "")
+    pr_url = _pr_url_from_payload(payload)
     is_private = repo.get("private", True)
+    config = load_config()
+
+    # Same opt-out as GitHub's `synchronize`: new commits on an already open PR
+    # only get reviewed on an explicit `@bot review` comment.
+    if action == "synchronized" and not config.review.review_on_synchronize:
+        logger.info(
+            "Forgejo PR %s push skipped — review.review_on_synchronize is off",
+            full_name,
+        )
+        if config.forgejo.approve_skipped_reviews:
+            await _approve_skipped_pr(
+                auth,
+                pr_url,
+                "Mira review skipped because review_on_synchronize is disabled.",
+            )
+        return
 
     # Same opt-outs as GitHub: `@mira ignore` in the description and the
     # mira-paused label both skip auto-review.
@@ -146,27 +209,80 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
         logger.info(
             "PR %s/%s#%d ignored via @%s ignore in description", owner, repo_name, number, bot_name
         )
+        if config.forgejo.approve_skipped_reviews:
+            await _approve_skipped_pr(
+                auth,
+                pr_url,
+                f"Mira review skipped because `@{bot_name} ignore` is set.",
+            )
         return
     labels = pr.get("labels") or []
     if any((lbl.get("name") or lbl.get("title")) == PAUSE_LABEL for lbl in labels):
         logger.info("PR %s/%s#%d paused via %s label", owner, repo_name, number, PAUSE_LABEL)
+        if config.forgejo.approve_skipped_reviews:
+            await _approve_skipped_pr(
+                auth,
+                pr_url,
+                f"Mira review skipped because the `{PAUSE_LABEL}` label is set.",
+            )
         return
 
     try:
         _get_app_db().register_repo(owner, repo_name, platform="forgejo")
         token = await auth.get_token()
-        provider = create_provider("forgejo", token)
-        await run_pr_review(
-            provider,
-            owner,
-            repo_name,
-            number,
-            pr_url,
-            is_private,
-            bot_name,
-            platform="forgejo",
-            pr_title=pr.get("title", "") or "",
-        )
+        provider = _forgejo_provider(token)
+        for attempt in range(2):
+            result = await run_pr_review(
+                provider,
+                owner,
+                repo_name,
+                number,
+                pr_url,
+                is_private,
+                bot_name,
+                platform="forgejo",
+                pr_title=pr.get("title", "") or "",
+            )
+            if result is None or result.delivery_failed:
+                return
+            if result.skipped_reason and not config.forgejo.approve_skipped_reviews:
+                return
+            if not result.skipped_reason and not config.forgejo.approve_successful_reviews:
+                return
+            if not result.reviewed_sha:
+                logger.warning(
+                    "Forgejo PR %s/%s#%d review returned no commit SHA; approval withheld",
+                    owner,
+                    repo_name,
+                    number,
+                )
+                return
+
+            current_pr = await provider.get_pr_info(pr_url)
+            if not current_pr.head_sha:
+                logger.warning(
+                    "Forgejo PR %s/%s#%d current commit SHA is unavailable; approval withheld",
+                    owner,
+                    repo_name,
+                    number,
+                )
+                return
+            if result.reviewed_sha != current_pr.head_sha:
+                logger.info(
+                    "Forgejo PR %s/%s#%d changed during review (%s -> %s)",
+                    owner,
+                    repo_name,
+                    number,
+                    result.reviewed_sha,
+                    current_pr.head_sha,
+                )
+                if attempt == 0:
+                    continue
+                return
+
+            current_pr.head_sha = result.reviewed_sha
+            await provider.approve_pr(current_pr, _approval_body(result.skipped_reason))
+            return
     except Exception:
         logger.exception(
             "Error handling Forgejo pull_request event for %s/%s#%d", owner, repo_name, number
@@ -237,6 +353,8 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
         _PAUSE_KEYWORDS,
         _REJECT_KEYWORDS,
         _RESUME_KEYWORDS,
+        _REVIEW_KEYWORDS,
+        _REVIEW_REST_KEYWORDS,
         PAUSE_LABEL,
         _open_store,
         run_pr_command,
@@ -274,7 +392,7 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
 
     try:
         token = await auth.get_token()
-        provider = create_provider("forgejo", token)
+        provider = _forgejo_provider(token)
         pr_info = await provider.get_pr_info(pr_url)
 
         # Accept a mention of either the configured name or the real bot user.
@@ -342,7 +460,7 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
             return
 
         # General PR comment → review / help / Q&A.
-        await run_pr_command(
+        result = await run_pr_command(
             provider,
             owner,
             repo_name,
@@ -353,6 +471,43 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
             bot_name,
             platform="forgejo",
         )
+        if (
+            result is not None
+            and not result.delivery_failed
+            and question.lower().strip() in (_REVIEW_KEYWORDS | _REVIEW_REST_KEYWORDS)
+        ):
+            config = load_config()
+            if result.skipped_reason and not config.forgejo.approve_skipped_reviews:
+                return
+            if not result.skipped_reason and not config.forgejo.approve_successful_reviews:
+                return
+            if not result.reviewed_sha:
+                logger.warning(
+                    "Forgejo PR %s/%s#%d manual review returned no commit SHA; approval withheld",
+                    owner,
+                    repo_name,
+                    number,
+                )
+                return
+            current_pr = await provider.get_pr_info(pr_url)
+            if not current_pr.head_sha:
+                logger.warning(
+                    "Forgejo PR %s/%s#%d current commit SHA is unavailable; approval withheld",
+                    owner,
+                    repo_name,
+                    number,
+                )
+                return
+            if result.reviewed_sha == current_pr.head_sha:
+                current_pr.head_sha = result.reviewed_sha
+                await provider.approve_pr(current_pr, _approval_body(result.skipped_reason))
+            else:
+                logger.info(
+                    "Forgejo PR %s/%s#%d changed during manual review; approval withheld",
+                    owner,
+                    repo_name,
+                    number,
+                )
     except Exception:
         logger.exception(
             "Error handling Forgejo issue_comment on %s/%s#%d", owner, repo_name, number
@@ -387,6 +542,30 @@ async def dispatch_forgejo_event(
             except ValueError:
                 owner, repo_name = "?", "?"
 
+            required_topic = cfg.forgejo.required_review_topic.strip().casefold()
+            if required_topic:
+                if owner == "?":
+                    return "ignored"
+                enrolled = await _required_topic_present(owner, repo_name, auth, required_topic)
+                if enrolled is None:
+                    return "ignored"
+                if not enrolled:
+                    logger.info(
+                        "Forgejo PR %s/%s#%s skipped — required topic %r is absent",
+                        owner,
+                        repo_name,
+                        number,
+                        required_topic,
+                    )
+                    if cfg.forgejo.approve_skipped_reviews:
+                        background_tasks.add_task(
+                            _approve_skipped_pr,
+                            auth,
+                            _pr_url_from_payload(payload),
+                            f"Mira review skipped because the required topic `{required_topic}` is absent.",
+                        )
+                    return "ignored"
+
             if author_is_filtered(actor, cfg.filter.allowed_authors, cfg.filter.blocked_authors):
                 logger.debug(
                     "PR %s/%s#%s skipped — author %s filtered by author filter",
@@ -395,6 +574,13 @@ async def dispatch_forgejo_event(
                     number,
                     actor,
                 )
+                if cfg.forgejo.approve_skipped_reviews:
+                    background_tasks.add_task(
+                        _approve_skipped_pr,
+                        auth,
+                        _pr_url_from_payload(payload),
+                        f"Mira review skipped because author `{actor}` is excluded by policy.",
+                    )
                 return "ignored"
             background_tasks.add_task(handle_forgejo_pr, payload, auth, bot_name)
             return "processing"
@@ -402,14 +588,27 @@ async def dispatch_forgejo_event(
         return "ignored"
 
     if event == "push":
+        repo_data = payload.get("repository", {})
+        default_branch = repo_data.get("default_branch", "main")
+        if payload.get("ref", "") != f"refs/heads/{default_branch}":
+            return "ignored"
         if author_is_filtered(actor, cfg.filter.allowed_authors, cfg.filter.blocked_authors):
             logger.debug("push ignored — author %s filtered", actor)
             return "ignored"
+        required_topic = cfg.forgejo.required_review_topic.strip().casefold()
+        if required_topic:
+            try:
+                owner, repo_name = _split_repo_path(repo_data.get("full_name", ""))
+            except ValueError:
+                return "ignored"
+            enrolled = await _required_topic_present(owner, repo_name, auth, required_topic)
+            if enrolled is not True:
+                return "ignored"
         background_tasks.add_task(handle_forgejo_push, payload, auth, bot_name)
         return "processing"
 
     if event == "issue_comment":
-        if payload.get("is_pull") is not True:
+        if payload.get("action") != "created" or payload.get("is_pull") is not True:
             return "ignored"
         names = mention_names(bot_name, bot_identity)
         comment_body = payload.get("comment", {}).get("body", "") or ""
@@ -420,6 +619,17 @@ async def dispatch_forgejo_event(
             elif author_is_filtered(actor, cfg.filter.allowed_authors, cfg.filter.blocked_authors):
                 logger.debug("issue_comment skipped — author %s filtered", actor)
                 return "ignored"
+            required_topic = cfg.forgejo.required_review_topic.strip().casefold()
+            if required_topic:
+                try:
+                    owner, repo_name = _split_repo_path(
+                        payload.get("repository", {}).get("full_name", "")
+                    )
+                except ValueError:
+                    return "ignored"
+                enrolled = await _required_topic_present(owner, repo_name, auth, required_topic)
+                if enrolled is not True:
+                    return "ignored"
             background_tasks.add_task(handle_forgejo_note, payload, auth, bot_name)
             return "processing"
         return "ignored"

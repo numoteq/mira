@@ -72,6 +72,21 @@ class TestLoadConfig:
         assert config.review.walkthrough is True
         assert config.review.walkthrough_sequence_diagram is True
         assert config.index.max_file_size == 1_048_576
+        assert config.forgejo.required_review_topic == ""
+        assert config.forgejo.approve_successful_reviews is False
+        assert config.forgejo.approve_skipped_reviews is False
+
+    def test_forgejo_deployment_config(self):
+        config = load_config(
+            overrides={
+                "forgejo.required_review_topic": "mira-review",
+                "forgejo.approve_successful_reviews": True,
+                "forgejo.approve_skipped_reviews": True,
+            }
+        )
+        assert config.forgejo.required_review_topic == "mira-review"
+        assert config.forgejo.approve_successful_reviews is True
+        assert config.forgejo.approve_skipped_reviews is True
 
     def test_llm_retry_timeout_defaults(self):
         from mira.config import LLMConfig

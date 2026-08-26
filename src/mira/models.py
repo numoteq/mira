@@ -395,6 +395,11 @@ class ReviewResult:
     reviewed_paths: list[str] = field(default_factory=list)
     skipped_paths: list[str] = field(default_factory=list)
     total_paths: list[str] = field(default_factory=list)
+    # Exact PR head reviewed by the engine. Platform handlers use this to avoid
+    # approving a newer commit that arrived while the review was running.
+    reviewed_sha: str = ""
+    # Final review output could not be delivered to the hosting platform.
+    delivery_failed: bool = False
     # Diagnostic trail: per-chunk draft counts and every comment dropped by a
     # filter/critique stage, so a benchmark run can show whether a missed
     # finding was never drafted or drafted-then-dropped. Not posted anywhere.

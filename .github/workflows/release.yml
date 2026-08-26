@@ -14,11 +14,15 @@ env:
 jobs:
   # Gate: the stable eval suite (excludes the noisy benchmark scorecard).
   evals:
+    if: github.repository == 'miracodeai/mira'
     uses: ./.github/workflows/evals.yml
     secrets: inherit
 
   build-and-push:
-    needs: evals # ← only builds/pushes if the eval gate is green
+    needs: evals
+    # Upstream releases require the LLM eval gate. The NUMOTEQ fork relies on
+    # its required main-branch CI because it does not hold upstream eval secrets.
+    if: always() && (needs.evals.result == 'success' || needs.evals.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: read

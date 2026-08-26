@@ -1,6 +1,15 @@
 # Mira configuration file
 # Copy this to .mira.yaml in your repository root
 
+forgejo:
+  # Require this repository topic before Forgejo webhook reviews, indexing, or commands.
+  # Empty keeps upstream behavior and applies no topic gate.
+  required_review_topic: ""
+  # Formally approve the exact commit after a successfully delivered review.
+  approve_successful_reviews: false
+  # Formally approve enrolled PRs when a review is intentionally skipped by policy.
+  approve_skipped_reviews: false
+
 llm:
   # Provider: "openai" (default, any OpenAI-compatible endpoint) or "bedrock" (AWS)
   # provider: "openai"

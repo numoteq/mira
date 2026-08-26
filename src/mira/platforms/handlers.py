@@ -21,6 +21,7 @@ from mira.llm import create_llm
 from mira.llm.prompts.review import build_conversation_prompt
 from mira.llm.tool_schemas import SUBMIT_THREAD_REPLY_TOOL
 from mira.llm.utils import strip_code_fences, strip_think_blocks
+from mira.models import ReviewResult
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,7 @@ async def run_pr_review(
     bot_name: str,
     platform: str = "github",
     pr_title: str = "",
-) -> None:
+) -> ReviewResult | None:
     """Platform-neutral review core: review a PR/MR and post the result.
 
     Shared by the GitHub and GitLab webhook handlers — everything here goes
@@ -98,7 +99,7 @@ async def run_pr_review(
     # two concurrent webhooks arrive. Returns False if already reviewing.
     if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
         logger.info("Review already in progress for %s, skipping", pr_url)
-        return
+        return None
 
     config = load_config()
     from mira.dashboard.models_config import llm_config_for
@@ -160,6 +161,7 @@ async def run_pr_review(
     await dispatch_event(REVIEW_COMPLETED, event_data)
     if any(sev >= Severity.WARNING for sev in stats):
         await dispatch_event(REVIEW_HIGH_SEVERITY, event_data)
+    return result
 
 
 async def run_pr_command(
@@ -173,7 +175,7 @@ async def run_pr_command(
     bot_name: str,
     platform: str = "github",
     pr_title: str = "",
-) -> None:
+) -> ReviewResult | None:
     """Platform-neutral handler for an @-mention command on a PR/MR.
 
     Dispatches help / review / review-rest / free-form Q&A through the provider
@@ -196,7 +198,7 @@ async def run_pr_command(
         pr_info_for_help = await provider.get_pr_info(pr_url)
         await provider.post_comment(pr_info_for_help, _help_message(bot_name))
         logger.info("Help requested on %s by @%s", pr_url, actor)
-        return
+        return None
 
     if is_review_rest:
         from mira.dashboard.api import _app_db
@@ -209,7 +211,7 @@ async def run_pr_command(
                 f"> @{actor}: nothing left to review — every file in this "
                 "PR has already been covered. 🎉",
             )
-            return
+            return None
         engine = ReviewEngine(
             config=config,
             llm=llm,
@@ -221,12 +223,12 @@ async def run_pr_command(
         engine._review_only_paths = set(progress.skipped_paths)  # type: ignore[attr-defined]
         if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
             logger.info("Review already in progress for %s, skipping", pr_url)
-            return
+            return None
         logger.info(
             "review-rest on %s by @%s — %d file(s)", pr_url, actor, len(progress.skipped_paths)
         )
         try:
-            await engine.review_pr(pr_url)
+            result = await engine.review_pr(pr_url)
             review_tracker.complete(repo_full, number)
         except Exception as exc:
             review_tracker.fail(repo_full, number, str(exc))
@@ -242,10 +244,10 @@ async def run_pr_command(
         )
         if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
             logger.info("Review already in progress for %s, skipping", pr_url)
-            return
+            return None
         logger.info("Re-review triggered for %s by @%s", pr_url, actor)
         try:
-            await engine.review_pr(pr_url)
+            result = await engine.review_pr(pr_url)
             review_tracker.complete(repo_full, number)
         except Exception as exc:
             review_tracker.fail(repo_full, number, str(exc))
@@ -262,6 +264,9 @@ async def run_pr_command(
         response = await llm.complete(messages, json_mode=False)
         await provider.post_comment(pr_info, f"> @{actor} asked: {question}\n\n{response}")
         logger.info("Replied to comment on %s", pr_url)
+        return None
+
+    return result
 
 
 async def run_thread_reply(

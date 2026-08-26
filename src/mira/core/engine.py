@@ -550,11 +550,13 @@ class ReviewEngine:
         )
 
         placeholder_id: int | None = None
+        placeholder_delivery_failed = False
         if not self.dry_run:
             try:
                 placeholder_id = await self._post_placeholder_comment(pr_info)
             except Exception as exc:
                 logger.warning("Failed to post walkthrough placeholder: %s", exc)
+                placeholder_delivery_failed = True
 
         _walkthrough_result: list[WalkthroughResult | None] = [None]
 
@@ -686,6 +688,8 @@ class ReviewEngine:
                 resolved_threads=resolved_thread_dicts or None,
                 team_conventions=team_conventions,
             )
+            if placeholder_delivery_failed:
+                result.delivery_failed = True
         except BaseException as exc:
             if overlap_task is not None:
                 overlap_task.cancel()
@@ -846,6 +850,7 @@ class ReviewEngine:
                         await self.provider.post_comment(pr_info, markdown)
                 except Exception as exc:
                     logger.warning("Failed to post walkthrough comment: %s", exc)
+                    result.delivery_failed = True
         elif placeholder_id is not None:
             # No walkthrough (all files excluded, empty diff, or generation
             # failed) — finalize the placeholder so it doesn't sit on
@@ -856,6 +861,7 @@ class ReviewEngine:
                 await self.provider.update_comment(pr_info, placeholder_id, markdown)
             except Exception as exc:
                 logger.warning("Failed to finalize walkthrough placeholder: %s", exc)
+                result.delivery_failed = True
 
         logger.info(
             "Thread resolution for PR %s: checked %d, resolved %d",
@@ -992,6 +998,7 @@ class ReviewEngine:
             except Exception as exc:
                 logger.debug("Failed to record last reviewed SHA: %s", exc)
 
+        result.reviewed_sha = pr_info.head_sha
         return result
 
     async def review_diff(self, diff_text: str) -> ReviewResult:
@@ -1024,7 +1031,10 @@ class ReviewEngine:
         # walkthrough can surface skipped files to the user.
         patch = parse_diff(diff_text)
         if not patch.files:
-            return ReviewResult(summary="No files to review.")
+            return ReviewResult(
+                summary="No files to review.",
+                skipped_reason="No changed files required review",
+            )
 
         filtered = filter_files(patch.files, self.config.filter)
         if not filtered:

@@ -646,6 +646,17 @@ class TestReviewEngine:
         assert result.reviewed_files > 0
 
     @pytest.mark.asyncio
+    async def test_placeholder_delivery_failure_is_recorded(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock
+    ):
+        mock_provider.post_comment = AsyncMock(side_effect=[RuntimeError("API error"), None])
+
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert result.delivery_failed is True
+
+    @pytest.mark.asyncio
     async def test_walkthrough_posted_with_summary(
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
