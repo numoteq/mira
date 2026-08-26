@@ -5,7 +5,8 @@ name: Release
 # evals run *before* the artifact ships, never alongside it.
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
