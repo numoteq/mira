@@ -237,7 +237,9 @@ class TestCompleteWithTools:
         assert "arguments" not in tool
 
     @pytest.mark.asyncio
-    async def test_forced_tool_choice(self, config: LLMConfig):
+    @pytest.mark.parametrize("force_tool_choice", [True, False])
+    async def test_configured_tool_choice(self, config: LLMConfig, force_tool_choice: bool):
+        config.force_tool_choice = force_tool_choice
         provider = ResponsesProvider(config)
         mock_data = _make_resp_tool("submit_review", "{}")
         mock_resp = _mock_httpx_response(mock_data, 200)
@@ -257,10 +259,9 @@ class TestCompleteWithTools:
             await provider.complete_with_tools([{"role": "user", "content": "review"}], tools=tools)
 
         body = mock_client.post.call_args[1]["json"]
-        assert body["tool_choice"] == {
-            "type": "function",
-            "name": "submit_review",
-        }
+        assert body["tool_choice"] == (
+            {"type": "function", "name": "submit_review"} if force_tool_choice else "auto"
+        )
 
     @pytest.mark.asyncio
     async def test_tool_choice_400_fallback(self, config: LLMConfig):

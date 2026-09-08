@@ -35,6 +35,7 @@ def _is_local_host(host: str) -> bool:
 
 
 class LLMConfig(BaseModel):
+    force_tool_choice: bool = True
     model: str = "anthropic/claude-sonnet-4-6"
     fallback_model: str | None = None
     # Optional per-purpose overrides. Fall back to `model` if not set.

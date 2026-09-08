@@ -533,9 +533,13 @@ class TestToolChoiceFallback:
         assert "deepseek/deepseek-v4-pro" in provider._no_forced_tool_choice
 
     @pytest.mark.asyncio
-    async def test_remembered_model_skips_forced_attempt(self):
-        provider = LLMProvider(LLMConfig(model="deepseek/deepseek-v4-pro"))
-        provider._no_forced_tool_choice.add("deepseek/deepseek-v4-pro")
+    @pytest.mark.parametrize("configured_auto", [False, True])
+    async def test_auto_mode_skips_forced_attempt(self, configured_auto):
+        provider = LLMProvider(
+            LLMConfig(model="deepseek/deepseek-v4-pro", force_tool_choice=not configured_auto)
+        )
+        if not configured_auto:
+            provider._no_forced_tool_choice.add("deepseek/deepseek-v4-pro")
         ok = _mock_httpx_response(_make_tool_response_json('{"comments": []}'))
 
         with patch("mira.llm.provider.httpx.AsyncClient") as cls:

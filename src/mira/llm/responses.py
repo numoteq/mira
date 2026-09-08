@@ -236,7 +236,11 @@ class ResponsesProvider(OpenAICompatibleProvider):
             "model": api_model,
             "input": _responses_input(messages),
             "tools": [_responses_tool(t) for t in tools],
-            "tool_choice": "auto" if api_model in self._no_forced_tool_choice else forced_choice,
+            "tool_choice": (
+                "auto"
+                if not self.config.force_tool_choice or api_model in self._no_forced_tool_choice
+                else forced_choice
+            ),
             "temperature": temperature if temperature is not None else self.config.temperature,
             "max_output_tokens": self.config.max_tokens,
         }

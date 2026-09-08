@@ -20,6 +20,8 @@ llm:
   fallback_model: "openai/gpt-4o-mini"
   temperature: 0.2
   max_tokens: 4096
+  # Set false to use tool_choice: auto for Chat Completions and Responses APIs.
+  force_tool_choice: true
 
   # ── AWS Bedrock configuration (uncomment to use) ──
   # provider: "bedrock"
